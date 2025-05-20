@@ -28,3 +28,6 @@ Desktop.ini
 coverage/
 build/
 dist/
+
+# 忽略 ping.js（不納入版本控制）
+ping.js
