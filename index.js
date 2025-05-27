@@ -435,68 +435,177 @@ function haversine(φ1,λ1,φ2,λ2){
 const RADIUS_KM=2.5;                                     // 篩選半徑
 
 async function findParking(lat,lng,originLabel='',mode='lot'){
+  // 取出所有常見費率欄位
+  function extractRates(r) {
+    let allRates = [];
+    if (Array.isArray(r.ParkingRates)) allRates = allRates.concat(r.ParkingRates);
+    if (Array.isArray(r.HourlyRates))  allRates = allRates.concat(r.HourlyRates);
+    if (Array.isArray(r.FlatRates))    allRates = allRates.concat(r.FlatRates);
+    if (Array.isArray(r.RentRates))    allRates = allRates.concat(r.RentRates);
+    if (Array.isArray(r.FreeRates))    allRates = allRates.concat(r.FreeRates);
+    return allRates;
+  }
   const token   = await getTDXAccessToken();
   const headers = { Authorization:`Bearer ${token}` };
   const cityCode= await getCityCode(lat,lng);
 
-  let rows=[], liveMap=new Map();
+  let rows=[], liveMap=new Map(), rateMap=new Map(), chargeTimeMap=new Map();
 
-  /* ---------- 5-1 Off-Street 停車場 ---------- */
+  // 5-1 Off-Street 停車場
   if (mode==='lot'){
     if (cityCode!=='ALL'){
       const base='https://tdx.transportdata.tw/api/basic/v1/Parking/OffStreet';
-      const [car,fac,ava]=await Promise.allSettled([
+      const [car,fac,ava,rate]=await Promise.allSettled([
         axios.get(makeCityURL(`${base}/CarPark`           ,cityCode),{headers,timeout:10000}),
         axios.get(makeCityURL(`${base}/ParkingFacility`   ,cityCode),{headers,timeout:10000}),
-        axios.get(makeCityURL(`${base}/ParkingAvailability`,cityCode),{headers,timeout:10000})
+        axios.get(makeCityURL(`${base}/ParkingAvailability`,cityCode),{headers,timeout:10000}),
+        axios.get(makeCityURL(`${base}/ParkingRate`       ,cityCode),{headers,timeout:10000})
       ]);
-      if (car.status==='fulfilled') rows.push(...(car.value.data.CarParks||[]));
-      if (fac.status==='fulfilled') rows.push(...(fac.value.data.ParkingFacilities||[]));
+      if (car.status==='fulfilled') {
+        const carParks = car.value.data.CarParks || [];
+        console.log('cityCode:', cityCode, 'CarParks.length:', carParks.length);
+        // 只保留有 CarParkID 的資料
+        rows.push(...carParks.filter(p => p.CarParkID));
+      }
+      // 不再合併 ParkingFacilities，避免 ID 對不起來
       if (ava.status==='fulfilled')
         (ava.value.data.ParkingAvailabilities||[]).forEach(a=>{
-          liveMap.set(a.ParkingFacilityID||a.CarParkID,a.AvailableSpaces??'—');
+          const key = String(a.ParkingFacilityID||a.CarParkID);
+          liveMap.set(key, a.AvailableSpaces??'—');
+        });
+      if (rate.status==='fulfilled')
+        (rate.value.data.ParkingRates||[]).forEach(r=>{
+          const key = String(r.ParkingFacilityID||r.CarParkID);
+          rateMap.set(key, r);
         });
     }
     if (!rows.length) rows=await taipeiOpenData(lat,lng);
     if (!rows.length)  return noData(mode);
   }
 
-  /* ---------- 5-2 On-Street 停車格 (Segment) ---------- */
+  // 5-2 On-Street 停車格 (Segment)
   if (mode==='slot'){
     if (cityCode==='ALL') return noData(mode);
 
     const base='https://tdx.transportdata.tw/api/basic/v1/Parking/OnStreet';
-    const [seg,ava]=await Promise.allSettled([
+    const [seg,ava,rate,chargeTime]=await Promise.allSettled([
       axios.get(makeCityURL(`${base}/ParkingSegment`,cityCode)           ,{headers,timeout:10000}),
-      axios.get(makeCityURL(`${base}/ParkingSegmentAvailability`,cityCode),{headers,timeout:10000})
+      axios.get(makeCityURL(`${base}/ParkingSegmentAvailability`,cityCode),{headers,timeout:10000}),
+      axios.get(makeCityURL(`${base}/ParkingSegmentRate`,cityCode)       ,{headers,timeout:10000}),
+      axios.get(makeCityURL(`${base}/ParkingSegmentChargeTime`,cityCode) ,{headers,timeout:10000})
     ]);
     if (seg.status==='fulfilled') rows=seg.value.data.ParkingSegments||[];
     if (!rows.length) return noData(mode);
 
     if (ava.status==='fulfilled')
       (ava.value.data.CurbParkingSegmentAvailabilities||[]).forEach(a=>{
-        liveMap.set(a.ParkingSegmentID,a.AvailableSpaces??'—');
+        const key = String(a.ParkingSegmentID);
+        liveMap.set(key, a.AvailableSpaces??'—');
+      });
+    if (rate.status==='fulfilled')
+      (rate.value.data.ParkingSegmentRates||[]).forEach(r=>{
+        const key = String(r.ParkingSegmentID);
+        rateMap.set(key, r);
+      });
+    if (chargeTime.status==='fulfilled')
+      (chargeTime.value.data.ParkingSegmentChargeTimes||[]).forEach(r=>{
+        const key = String(r.ParkingSegmentID);
+        chargeTimeMap.set(key, r);
       });
   }
 
-  /* ---------- 5-3 組合 / 排序 ---------- */
-  const list=rows.map(p=>{
-      const pos= mode==='lot'
-        ? (p.CarParkPosition||p.OffStreetMapPosition||{})
-        : (p.ParkingSegmentPosition||{});
-      const φ=+pos.PositionLat, λ=+pos.PositionLon;
-      if (Number.isNaN(φ)||Number.isNaN(λ)) return null;
-      const id   = p.CarParkID||p.ParkingFacilityID||p.ParkingSegmentID;
-      const name = mode==='lot'
-        ? ((p.CarParkName||p.ParkingFacilityName||{}).Zh_tw||p.CarParkName)
-        : (p.ParkingSegmentName?.Zh_tw||`路段 ${id}`);
-      const addr = mode==='lot' ? (p.Address||p.CarParkAddress||'—') : '—';
-      return { id,name,addr,lat:φ,lng:λ,avail:liveMap.get(id),
-               dist:haversine(lat,lng,φ,λ) };
-    })
+  // 5-3 組合 / 排序
+  // Debug: 印出主資料與費率 Map 的 key
+  console.log('rows:', rows);
+  console.log('主資料 IDs:', rows.map(p => String(p.CarParkID)));
+  console.log('費率 Map keys:', Array.from(rateMap.keys()));
+
+  const list = rows.map(p => {
+    const pos = mode === 'lot'
+      ? (p.CarParkPosition || p.OffStreetMapPosition || {})
+      : (p.ParkingSegmentPosition || {});
+    const φ = +pos.PositionLat, λ = +pos.PositionLon;
+    if (Number.isNaN(φ) || Number.isNaN(λ)) return null;
+    // slot 模式下 id 應用 ParkingSegmentID
+    const id = mode === 'lot'
+      ? String(p.CarParkID)
+      : String(p.ParkingSegmentID);
+    const name = mode === 'lot'
+      ? ((p.CarParkName || {}).Zh_tw || p.CarParkName || `停車場 ${id}`)
+      : (p.ParkingSegmentName?.Zh_tw || `路段 ${id}`);
+    // slot 地址組合 RoadSection
+    const addr = mode === 'lot'
+      ? (p.Address || p.CarParkAddress || '—')
+      : (
+          (typeof p.RoadSection === 'object'
+            ? [p.RoadSection.Start, p.RoadSection.End].filter(Boolean).join('~')
+            : p.RoadSection) ||
+          (typeof p.SideName === 'object' ? p.SideName?.Zh_tw : p.SideName) ||
+          '—'
+        );
+
+    // slot 模式優先顯示主資料的 FareDescription
+    let rateInfo = '暫無資料', chargeTimeInfo = null;
+    if (mode === 'lot') {
+      const r = rateMap.get(id);
+      if (!r) console.log('找不到費率資料 id:', id);
+      else console.log('費率資料:', r);
+      if (r) {
+        const allRates = extractRates(r);
+        if (allRates.length > 0) {
+          // 優先顯示 RateDescription，其次 RateName，再組合金額
+          const descs = allRates.map(x => x.RateDescription || x.RateName).filter(Boolean);
+          if (descs.length > 0) {
+            rateInfo = descs.join('；');
+          } else {
+            const prices = allRates.map(x => {
+              if (x.RatePrice && x.RateQualifier)
+                return `${x.RatePrice}元/${x.RateQualifier}分`;
+              if (x.RatePrice)
+                return `${x.RatePrice}元`;
+              return null;
+            }).filter(Boolean);
+            if (prices.length > 0) rateInfo = prices.join('；');
+          }
+        }
+      }
+    } else {
+      // slot: 優先主資料的 FareDescription
+      if (p.FareDescription && typeof p.FareDescription === 'string' && p.FareDescription.trim()) {
+        rateInfo = p.FareDescription.trim();
+      } else {
+        // fallback: rateMap
+        const r = rateMap.get(id);
+        if (!r) console.log('找不到費率資料 id:', id);
+        else console.log('費率資料:', r);
+        if (r && Array.isArray(r.ParkingSegmentRates) && r.ParkingSegmentRates.length > 0) {
+          const descs = r.ParkingSegmentRates.map(x => x.Description).filter(Boolean);
+          if (descs.length > 0) {
+            rateInfo = descs.join('；');
+          } else {
+            const rates = r.ParkingSegmentRates.map(x => {
+              if (x.ChargeAmount && x.ChargeType) return `${x.ChargeAmount}元/${x.ChargeType}`;
+              if (x.ChargeAmount) return `${x.ChargeAmount}元`;
+              return null;
+            }).filter(Boolean);
+            if (rates.length > 0) rateInfo = rates.join('；');
+          }
+        }
+      }
+      const t = chargeTimeMap.get(id);
+      if (t && Array.isArray(t.ParkingSegmentChargeTimes) && t.ParkingSegmentChargeTimes.length > 0) {
+        const timeDescs = t.ParkingSegmentChargeTimes.map(x => x.ChargeTimeDescription).filter(Boolean);
+        if (timeDescs.length > 0) chargeTimeInfo = timeDescs.join('；');
+      }
+    }
+    return {
+      id, name, addr, lat: φ, lng: λ, avail: liveMap.get(id),
+      dist: haversine(lat, lng, φ, λ), rateInfo, chargeTimeInfo
+    };
+  })
     .filter(Boolean)
-    .sort((a,b)=>a.dist-b.dist)
-    .slice(0,10);
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, 10);
 
   /* ---------- 5-4 Google 距離 (可選) ---------- */
   if (GOOGLE_MAPS_KEY && list.length){
@@ -514,15 +623,17 @@ async function findParking(lat,lng,originLabel='',mode='lot'){
     }catch{}
   }
 
-  /* ---------- 5-5 純文字 ---------- */
+  // 5-5 純文字
   const plain = (originLabel?`📍 ${originLabel}\n\n`:'') +
     list.slice(0,5).map(c=>[
       `${mode==='lot'?'🅿️':'🚗'} ${c.name}`,
       `地址：${c.addr}`,
       c.avail!==undefined ? `剩餘：${c.avail}` : null,
+      c.rateInfo ? `收費：${c.rateInfo}` : null,
+      c.chargeTimeInfo ? `時段：${c.chargeTimeInfo}` : null,
       c.road ? `開車：${c.road}，約 ${c.time}` : `直線距離：${c.dist.toFixed(2)} km`
     ].filter(Boolean).join('\n')).join('\n\n') +
-    `\n\n📊 資料來源：TDX ${mode==='lot'?'Off-Street':'On-Street Segment'}`;
+    `\n\n⚠️ 請注意行車安全`;
 
   return { plain, flex:buildFlex(list,mode) };
 }
@@ -544,7 +655,9 @@ function buildFlex(arr,mode){
             { type:'text',text:`${mode==='lot'?'🅿️':'🚗'} ${c.name}`,weight:'bold',size:'lg',wrap:true },
             { type:'text',text:c.road?`開車：約 ${c.road}`:`距離：約 ${c.dist.toFixed(2)} km`,
               size:'sm',color:'#666666' },
-            c.avail!==undefined?{ type:'text',text:`剩餘：${c.avail}`,size:'sm',color:'#666666'}:null
+            c.avail!==undefined?{ type:'text',text:`剩餘：${c.avail}`,size:'sm',color:'#666666'}:null,
+            c.rateInfo?{ type:'text',text:`收費：${c.rateInfo}`,size:'sm',color:'#666666'}:null,
+            c.chargeTimeInfo?{ type:'text',text:`時段：${c.chargeTimeInfo}`,size:'sm',color:'#666666'}:null
           ].filter(Boolean)},
           footer:{ type:'box',layout:'vertical',contents:[
             { type:'button',style:'primary',color:'#D14124',
