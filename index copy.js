@@ -347,8 +347,7 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const line = require('@line/bot-sdk');
-
-const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 
 /* ---------- 1. ENV ---------- */
 const {
@@ -361,216 +360,86 @@ const {
   PORT = 3450,
 } = process.env;
 
-/* ---------- 2. LINE / Express 基礎啟動 ---------- */
+/* ---------- 2. LINE / Express ---------- */
 const lineConfig = {
-  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN || '',
-  channelSecret: LINE_CHANNEL_SECRET || ''
+  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: LINE_CHANNEL_SECRET,
 };
-let client = null;
-try {
-  if (LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_SECRET) {
-    client = new line.Client(lineConfig);
-  } else {
-    console.warn('⚠️ 缺少 LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET，將以本地模式執行，不處理 webhook。');
-  }
-} catch (e) {
-  console.warn('建立 LINE Client 失敗：', e.message);
-}
-
+const client = new line.Client(lineConfig);
 
 const app = express();
-// 若部署在反向代理 (例如 Render / Heroku / Nginx) 且會加上 X-Forwarded-*，需啟用 trust proxy；
-// 本地測試若出現 express-rate-limit 的 X-Forwarded-For 警告，也可透過此設定移除。
-app.set('trust proxy', 1);
-// 保存 LINE Webhook 原始請求體以通過簽章驗證
-const rawBodySaver = (req, res, buf) => { if (req.originalUrl === '/webhook') req.rawBody = buf; };
-app.use(express.json({ verify: rawBodySaver }));
-const rateLimit = require('express-rate-limit');
-const limiter = rateLimit({ windowMs:60*1000, max:30, standardHeaders:true, legacyHeaders:false });
-if (client) app.use('/webhook', limiter);
 
-// 使用者狀態暫存
-const lastMode = new Map(); // userId -> 'lot'|'slot'
-const lastResults = new Map(); // userId -> 最近查詢結果
-if(!global.userProfiles) global.userProfiles = new Map();
-if(!global.parkingEvents) global.parkingEvents = []; // {id,name,lat,lng,radius,start,end,notice}
+// --- 防刷流量控管 ---
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // 每 IP 每分鐘最多 10 次
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    status: 429,
+    message: '⚠️ 請勿過度頻繁操作，請稍後再試。',
+  },
+});
 
-function getUserProfile(userId){
-  if(!userId) return null;
-  if(!global.userProfiles.has(userId)){
-    global.userProfiles.set(userId, {
-      favorites:new Set(),
-      reports:[],
-      timers:[],
-      activeTimer:null,
-      parkedLocation:null,
-      prefs:{ distance:0.5, avail:0.3, price:0.2, evOnly:false },
-      stats:{ searches:0, found:0 }
-    });
+// 只針對 /webhook 路徑加嚴格限制
+app.use('/webhook', limiter);
+
+app.get('/', (_, res) => res.send('🚗 Parking-bot is running!'));
+
+// 新增 getCityCode API 路由
+app.get('/getCityCode', async (req, res) => {
+  const { lat, lng } = req.query;
+  if (!lat || !lng) return res.status(400).json({ error: 'lat/lng required' });
+  try {
+    const code = await getCityCode(Number(lat), Number(lng));
+    res.json({ cityCode: code });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-  return global.userProfiles.get(userId);
-}
-// 查詢模式關鍵字與偵測 (lot=停車場 / slot=路邊停車格)
+});
+app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
+  try {
+    const r = await Promise.all(req.body.events.map(handleEvent));
+    res.json(r);
+  } catch (e) {
+    console.error('Webhook error:', e);
+    res.status(500).end();
+  }
+});
+app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
+
+/* ---------- 3. 指令 ---------- */
 const MODE_KEYWORDS = {
-  lot : ['停車場','查詢附近停車場','找停車場','附近停車場'],
-  slot: ['停車格','路邊停車格','查詢附近停車格','找停車格','附近停車格']
+  lot: ['停車場', '查詢附近停車場'],
+  slot: ['停車格', '路邊停車格', '查詢附近停車格'],
 };
-function detectMode(t){
-  if(!t) return null;
-  if(MODE_KEYWORDS.slot.some(k=>t.includes(k))) return 'slot';
-  if(MODE_KEYWORDS.lot.some(k=>t.includes(k))) return 'lot';
+function detectMode(t) {
+  if (MODE_KEYWORDS.slot.some((k) => t.includes(k))) return 'slot';
+  if (MODE_KEYWORDS.lot.some((k) => t.includes(k))) return 'lot';
   return null;
 }
-function activeEvents(lat,lng,now=Date.now()){
-  return global.parkingEvents.filter(e=> now>=e.start && now<=e.end && haversine(lat,lng,e.lat,e.lng) <= (e.radius/1000));
-}
-
-app.get('/', (_,res)=>res.send('🚗 Parking-bot server 已啟動')); 
-app.get('/health', (_,res)=>res.json({ ok:true, time:new Date().toISOString() }));
-app.get('/getCityCode', async (req,res)=>{
-  const {lat,lng} = req.query; if(!lat||!lng) return res.status(400).json({error:'lat/lng required'});
-  try{ const c = await getCityCode(+lat,+lng); res.json({cityCode:c}); }catch(e){ res.status(500).json({error:e.message}); }
-});
-// 簡易活動列出（之後可加認證）
-app.get('/events', (_,res)=> res.json(global.parkingEvents));
-
-if (client){
-  app.post('/webhook', line.middleware(lineConfig), async (req,res)=>{
-    try{
-      const result = await Promise.all(req.body.events.map(handleEvent));
-      res.json(result);
-    }catch(e){ console.error('Webhook error:', e); res.status(500).end(); }
-  });
-}
-
-app.listen(PORT, ()=> console.log(`🚀 停車服務啟動於 :${PORT}`));
+const lastMode = new Map(); // userId → 'lot'|'slot'
 
 /* ---------- 4. 事件 ---------- */
 async function handleEvent(e) {
-  const userId = e.source?.userId;
-  const profile = getUserProfile(userId);
   /* 4-1 位置訊息 */
   if (e.type === 'message' && e.message.type === 'location') {
-    const latMsg = e.message.latitude;
-    const lngMsg = e.message.longitude;
-    // 若正在計時且尚未記錄停車位置 => 只記錄，不觸發查詢以節省 API
-    if(profile && profile.activeTimer && !profile.parkedLocation){
-      const candidates = lastResults.get(userId) || [];
-      let nearest = null, minD = Infinity;
-      for(const c of candidates){
-        const d = haversine(latMsg, lngMsg, c.lat, c.lng);
-        if(d < minD){ minD = d; nearest = c; }
-      }
-      if(nearest && minD <= 0.25){ // 250 公尺內視為停在該停車場/路段
-        profile.parkedLocation = { lat:latMsg, lng:lngMsg, lotId:nearest.id, lotName:nearest.name, ts:Date.now(), distToLot:minD };
-        if(profile.activeTimer) profile.activeTimer.lotId = nearest.id;
-        return client.replyMessage(e.replyToken,{ type:'text', text:`✅ 已記錄停車位置：${nearest.name}\n距離結果座標 ${minD.toFixed(2)} km\n輸入「找車」可導航回車，或「更新停車位置」重新設定。` });
-      }else{
-        profile.parkedLocation = { lat:latMsg, lng:lngMsg, lotId:null, lotName:null, ts:Date.now() };
-        return client.replyMessage(e.replyToken,{ type:'text', text:'✅ 已記錄停車座標 (未匹配附近停車場)。輸入「找車」可導航回車，或再次分享位置覆蓋。' });
-      }
-    }
-    // 否則執行一般查詢流程
     const mode = lastMode.get(e.source.userId) || 'lot';
-    const r = await findParking(latMsg, lngMsg, '', mode, userId);
-    lastResults.set(userId, r.rawList);
-    if(profile){ profile.stats.searches++; profile.lastSearchOrigin = { lat:latMsg,lng:lngMsg,mode,ts:Date.now() }; }
-    const acts = activeEvents(latMsg, lngMsg);
-    const actMsg = acts.length ? [{ type:'text', text: '🎪 附近活動：\n' + acts.map(a=>`${a.name} - ${a.notice||''}`).join('\n') }] : [];
-    return client.replyMessage(e.replyToken,[ { type: 'text', text: r.plain }, r.flex, ...actMsg ].filter(Boolean));
+    const r = await findParking(
+      e.message.latitude,
+      e.message.longitude,
+      '',
+      mode
+    );
+    return client.replyMessage(
+      e.replyToken,
+      [{ type: 'text', text: r.plain }, r.flex].filter(Boolean)
+    );
   }
 
   /* 4-2 文字訊息 */
   if (e.type === 'message' && e.message.type === 'text') {
     const q = e.message.text.trim();
-    // --- 系統指令處理 (簡易) ---
-    const lower = q.toLowerCase();
-    if(lower === '我的收藏' && profile){
-      const favIds = Array.from(profile.favorites);
-      if(!favIds.length) return client.replyMessage(e.replyToken,{ type:'text', text:'⭐ 尚未收藏。可在查詢結果後用「收藏 ID」指令收藏。'});
-      const list = (lastResults.get(userId)||[]).filter(x=>profile.favorites.has(x.id));
-      if(list.length){
-        return client.replyMessage(e.replyToken,{ type:'text', text:'⭐ 我的收藏：\n'+ list.map(c=>`${c.id} ${c.name} (${c.dist.toFixed(2)}km)`).join('\n') });
-      }else{
-        return client.replyMessage(e.replyToken,{ type:'text', text:'⭐ 收藏 ID：'+favIds.join(', ')+' (如需詳細請再次分享目前位置查詢)' });
-      }
-    }
-    if(/^收藏\s+\S+/.test(q) && profile){
-      const id = q.split(/\s+/)[1];
-      profile.favorites.add(id);
-      return client.replyMessage(e.replyToken,{ type:'text', text:`已收藏 ${id}。` });
-    }
-    if(/^取消收藏\s+\S+/.test(q) && profile){
-      const id = q.split(/\s+/)[1];
-      profile.favorites.delete(id);
-      return client.replyMessage(e.replyToken,{ type:'text', text:`已取消收藏 ${id}。` });
-    }
-  if(/^回報\s+\S+\s+\S+/.test(q) && profile){
-      const [, targetId, statusRaw] = q.split(/\s+/);
-      const statusMap = { '有位':'AVAILABLE','滿':'FULL','關閉':'CLOSED' };
-      const status = statusMap[statusRaw] || statusRaw.toUpperCase();
-      profile.reports.push({ id:crypto.randomUUID(), targetId, status, ts:Date.now() });
-      return client.replyMessage(e.replyToken,{ type:'text', text:`✅ 已回報 ${targetId} 狀態：${status}` });
-    }
-  if(q === '只看EV' && profile){ profile.prefs.evOnly = true; return client.replyMessage(e.replyToken,{ type:'text', text:'🔌 已啟用只看 EV/充電停車場。'}); }
-  if(q === '取消EV' && profile){ profile.prefs.evOnly = false; return client.replyMessage(e.replyToken,{ type:'text', text:'🔌 已取消只看 EV 篩選。'}); }
-    if(/^(開始計時|我停好了)(\s+\S+)?$/.test(q) && profile){
-      if(profile.activeTimer) return client.replyMessage(e.replyToken,{ type:'text', text:'⏱ 已在計時中。用「結束計時」停止。'});
-      profile.activeTimer = { start:Date.now(), lotId:null };
-      // 若有附帶 ID 直接綁定
-      const m = q.split(/\s+/);
-      if(m.length>=2){
-        const targetId = m[1];
-        const list = lastResults.get(userId)||[];
-        const found = list.find(x=>x.id===targetId);
-        if(found){
-          profile.parkedLocation = { lat:found.lat, lng:found.lng, lotId:found.id, lotName:found.name, ts:Date.now(), distToLot:0 };
-          profile.activeTimer.lotId = found.id;
-          return client.replyMessage(e.replyToken,{ type:'text', text:`⏱ 已開始計時並記錄：${found.name}\n(可輸入「找車」導航，或分享位置覆蓋)` });
-        }
-      }
-      return client.replyMessage(e.replyToken,{ type:'text', text:'⏱ 已開始停車計時。請在實際停妥位置「分享位置」一次以記錄停車點，或輸入「開始計時 停車場ID」。'});
-    }
-    if(/^(結束計時|我離開了)$/.test(q) && profile){
-      if(!profile.activeTimer) return client.replyMessage(e.replyToken,{ type:'text', text:'尚未開始計時。'});
-      const session = profile.activeTimer; profile.activeTimer = null;
-      session.end = Date.now();
-      const mins = Math.ceil((session.end - session.start)/60000);
-      // 簡易費用估算：抓最近結果第一筆 rateInfo 中第一個數字/每小時
-      let estFee = 0;
-      const res = lastResults.get(userId);
-      if(res && res.length){
-        const rate = res[0].rateInfo || '';
-        const m = rate.match(/(\d+)(?:元|\$)/);
-        if(m){
-          const per = parseInt(m[1],10);
-          // 假設為每小時
-          estFee = Math.round(per * (mins/60));
-        }
-      }
-      session.estFee = estFee;
-      profile.timers.push(session);
-      return client.replyMessage(e.replyToken,{ type:'text', text:`⏱ 本次停車 ${mins} 分鐘，預估費用約 ${estFee} 元。` });
-    }
-    if(q === '找車' && profile){
-      if(!profile.parkedLocation) return client.replyMessage(e.replyToken,{ type:'text', text:'尚未記錄停車位置。請先「開始計時」再分享位置一次。'});
-      const {lat,lng,lotName} = profile.parkedLocation;
-      const nav = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
-      return client.replyMessage(e.replyToken,{ type:'text', text:`🚶 導航回車：${lotName?lotName+'\n':''}${nav}` });
-    }
-    if(q === '更新停車位置' && profile){
-      profile.parkedLocation = null;
-      return client.replyMessage(e.replyToken,{ type:'text', text:'🔄 請於車旁再次分享位置以重新記錄。'});
-    }
-    if(q === '我的本週摘要' && profile){
-      const weekAgo = Date.now()-7*86400000;
-      const reports = profile.reports.filter(r=>r.ts>=weekAgo).length;
-      const sessions = profile.timers.filter(t=>t.end && t.end>=weekAgo);
-      const totalMins = sessions.reduce((a,s)=>a+Math.ceil((s.end-s.start)/60000),0);
-      const totalFee = sessions.reduce((a,s)=>a+(s.estFee||0),0);
-      return client.replyMessage(e.replyToken,{ type:'text', text:`📊 七日摘要\n查詢次數：${profile.stats.searches}\n回報次數：${reports}\n停車次數：${sessions.length}\n累計時數：${(totalMins/60).toFixed(1)} 小時\n預估費用：${totalFee} 元` });
-    }
-
     const mode = detectMode(q);
 
     /* 指令 */
@@ -599,9 +468,7 @@ async function handleEvent(e) {
         type: 'text',
         text: '❓ 找不到此地址，請再確認或直接分享「位置資訊」。',
       });
-  const r = await findParking(geo.lat, geo.lng, geo.formatted, 'lot', userId);
-  lastResults.set(userId, r.rawList);
-  if(profile) profile.stats.searches++;
+    const r = await findParking(geo.lat, geo.lng, geo.formatted, 'lot');
     return client.replyMessage(
       e.replyToken,
       [{ type: 'text', text: r.plain }, r.flex].filter(Boolean)
@@ -627,8 +494,7 @@ function haversine(φ1, λ1, φ2, λ2) {
 }
 const RADIUS_KM = 2.5; // 篩選半徑
 
-async function findParking(lat, lng, originLabel = '', mode = 'lot', userId=null) {
-  const profile = getUserProfile(userId);
+async function findParking(lat, lng, originLabel = '', mode = 'lot') {
   // 取出所有常見費率欄位
   function extractRates(r) {
     let allRates = [];
@@ -904,82 +770,84 @@ async function findParking(lat, lng, originLabel = '', mode = 'lot', userId=null
         }))
         .filter((p) => p.dist <= RADIUS_KM); // 只保留2.5公里內
     } catch (e) {
-  console.warn('Google Places API error:', e.message);
+      if (e.response && e.response.data) {
+        console.warn(
+          'Google Places API error:',
+          JSON.stringify(e.response.data),
+          e.response.status
+        );
+      } else {
+        console.warn('Google Places API error:', e.message);
+      }
     }
   }
-  // ---- 合併與去重 ----
+
+  // 合併 TDX/OD 與 Google 結果，Google 結果優先，且都過濾距離
   const allList = [
-    ...googlePlaces.filter(g=> !list.some(t=> Math.abs(t.lat-g.lat)<0.0002 && Math.abs(t.lng-g.lng)<0.0002)),
-    ...list
-  ].filter(p=> p.dist <= RADIUS_KM);
+    ...googlePlaces.filter(
+      (g) =>
+        !list.some(
+          (t) =>
+            Math.abs(t.lat - g.lat) < 0.0002 && Math.abs(t.lng - g.lng) < 0.0002
+        )
+    ),
+    ...list,
+  ]
+    .filter((p) => p.dist <= RADIUS_KM)
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, 10);
 
-  // Google 距離矩陣（可選）
-  if(GOOGLE_MAPS_KEY && allList.length){
-    try{
-      const dest = allList.map(c=>`${c.lat},${c.lng}`).join('|');
-      const {data} = await axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', { params:{ origins:`${lat},${lng}`, destinations:dest, mode:'driving', key:GOOGLE_MAPS_KEY }, timeout:8000 });
-      if(data.status==='OK') data.rows[0].elements.forEach((el,i)=>{
-        allList[i].road = el.status==='OK' ? (el.distance.value/1000).toFixed(1)+' km' : null;
-        allList[i].time = el.status==='OK' ? el.duration.text : null;
-      });
-    }catch{/* ignore */}
+  /* ---------- 5-4 Google 距離 (可選) ---------- */
+  if (GOOGLE_MAPS_KEY && allList.length) {
+    try {
+      const dest = allList.map((c) => `${c.lat},${c.lng}`).join('|');
+      const { data } = await axios.get(
+        'https://maps.googleapis.com/maps/api/distancematrix/json',
+        {
+          params: {
+            origins: `${lat},${lng}`,
+            destinations: dest,
+            mode: 'driving',
+            key: GOOGLE_MAPS_KEY,
+          },
+          timeout: 8000,
+        }
+      );
+      if (data.status === 'OK')
+        data.rows[0].elements.forEach((e, i) => {
+          allList[i].road =
+            e.status === 'OK'
+              ? (e.distance.value / 1000).toFixed(1) + ' km'
+              : null;
+          allList[i].time = e.status === 'OK' ? e.duration.text : null;
+        });
+    } catch {}
   }
 
-  // EV 篩選
-  if(profile?.prefs?.evOnly){
-    for(let i=allList.length-1;i>=0;i--){
-      const txt = (allList[i].name + ' ' + (allList[i].rateInfo||'')).toLowerCase();
-      if(!/ev|充電|電動/.test(txt)) allList.splice(i,1);
-    }
-  }
+  // 5-5 純文字
+  const plain =
+    (originLabel ? `📍 ${originLabel}\n\n` : '') +
+    allList
+      .slice(0, 5)
+      .map((c) =>
+        [
+          `${mode === 'lot' ? '🅿️' : '🚗'} ${c.name}`,
+          `地址：${c.addr}`,
+          c.avail !== undefined ? `剩餘：${c.avail}` : null,
+          c.rateInfo ? `收費：${c.rateInfo}` : null,
+          c.chargeTimeInfo ? `時段：${c.chargeTimeInfo}` : null,
+          c.source ? `來源：${c.source}` : null,
+          c.road
+            ? `開車：${c.road}，約 ${c.time}`
+            : `直線距離：${c.dist.toFixed(2)} km`,
+        ]
+          .filter(Boolean)
+          .join('\n')
+      )
+      .join('\n\n') +
+    `\n\n⚠️ 請注意行車安全`;
 
-  // 可用數歷史 + 簡易預測
-  if(!global.availHistory) global.availHistory = new Map();
-  allList.forEach(item=>{
-    const val = parseInt(item.avail,10);
-    if(Number.isFinite(val)){
-      if(!global.availHistory.has(item.id)) global.availHistory.set(item.id,[]);
-      const arr = global.availHistory.get(item.id);
-      arr.push({ts:Date.now(), v:val});
-      while(arr.length>20) arr.shift();
-      const avg = arr.reduce((a,b)=>a+b.v,0)/arr.length;
-      item.predictedAvail = Math.max(0, Math.round(avg*0.95));
-    }
-  });
-
-  // 智慧排序 (距離 / 剩餘 / 預測 / 價格 / 收藏 / 來源)
-  const maxDist = Math.max(...allList.map(x=>x.dist),1);
-  allList.forEach(item=>{
-    const distScore = 1 - (item.dist / maxDist);
-    const availNum = parseInt(item.avail,10);
-    const availScore = Number.isFinite(availNum)? Math.min(availNum/50,1):0;
-    const predScore = Number.isFinite(item.predictedAvail)? Math.min(item.predictedAvail/50,1):availScore;
-    let priceScore = 0.5;
-    if(item.rateInfo){
-      const nums = [...item.rateInfo.matchAll(/(\d{1,4})/g)].map(m=>+m[1]).filter(n=>n>0);
-      if(nums.length){ const min = Math.min(...nums); priceScore = 1 - Math.min(min/100,1); }
-    }
-    const favBoost = profile && profile.favorites.has(item.id) ? 0.15 : 0;
-    const sourceBoost = item.source==='Google'?0.02:0;
-    const w = profile?profile.prefs:{ distance:0.5, avail:0.3, price:0.2 };
-    item.score = distScore*w.distance + ((availScore+predScore)/2)*w.avail + priceScore*w.price + favBoost + sourceBoost;
-  });
-  allList.sort((a,b)=> b.score - a.score);
-
-  const plain = (originLabel?`📍 ${originLabel}\n\n`:'') + allList.slice(0,5).map(c=>[
-    `${mode==='lot'?'🅿️':'🚗'} ${c.name}`,
-    `ID：${c.id}`,
-    `地址：${c.addr}`,
-    c.avail!==undefined?`剩餘：${c.avail}`:null,
-    c.predictedAvail!==undefined?`預測：${c.predictedAvail}`:null,
-    c.rateInfo?`收費：${c.rateInfo}`:null,
-    c.chargeTimeInfo?`時段：${c.chargeTimeInfo}`:null,
-    c.source?`來源：${c.source}`:null,
-    c.score!==undefined?`智慧分：${c.score.toFixed(2)}`:null,
-    c.road?`開車：${c.road}，約 ${c.time}`:`直線距離：${c.dist.toFixed(2)} km`
-  ].filter(Boolean).join('\n')).join('\n\n') + `\n\n🔧 指令：收藏 ID｜取消收藏 ID｜回報 ID 狀態(有位/滿/關閉)｜開始計時｜結束計時｜找車｜我的收藏｜我的本週摘要｜只看EV｜取消EV\n⚠️ 請注意行車安全`;
-
-  return { plain, flex: buildFlex(allList, mode), rawList: allList };
+  return { plain, flex: buildFlex(allList, mode) };
 }
 function noData(mode) {
   return {
