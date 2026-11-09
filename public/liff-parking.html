@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Parking Bot – 定位分享</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    html,body{margin:0;padding:0;font-family:"Noto Sans TC",sans-serif;background:#F5F7FA;color:#333;display:flex;align-items:center;justify-content:center;height:100vh}
+    #card{background:#fff;border-radius:16px;box-shadow:0 4px 12px rgba(0,0,0,.12);padding:24px;width:280px;text-align:center}
+    h1{font-size:20px;margin:0 0 12px}
+    .btn{display:inline-block;margin-top:18px;padding:12px 24px;border-radius:8px;background:#4A90E2;color:#fff;font-weight:600;text-decoration:none}
+    .btn:active{transform:translateY(1px)}
+    #error{color:#E14545;white-space:pre-wrap;margin-top:8px;font-size:14px}
+  </style>
+</head>
+<body>
+  <div id="card">
+    <h1>定位中…</h1>
+    <p>請稍候，或點按下方重新嘗試</p>
+    <a id="retry" href="#" class="btn" style="display:none">重新定位</a>
+    <div id="error"></div>
+  </div>
+
+<script>
+(async() => {
+  const qs = new URLSearchParams(location.search);
+  const mode = qs.get('mode') || 'lot';                // lot | slot
+  const liffId = qs.get('liffId');                     // 可選：用 query 指定 LIFF ID
+  try {
+    await liff.init({ liffId });                       // 若 liffId=null 會用後台設定的 LIFF ID
+  } catch(err){
+    showError('LIFF 初始化失敗\n'+ err.message);
+    return;
+  }
+
+  // 取得定位 & 回傳
+  async function sendLocation(){
+    try{
+      const pos = await new Promise((res,rej)=>
+        navigator.geolocation.getCurrentPosition(res,rej,{ enableHighAccuracy:true, timeout:10000 }));
+      await liff.sendMessages([{                       // 傳單則 location
+        type : 'location',
+        title: mode,                                  // 在 Bot 中用 e.message.title 判斷 lot/slot
+        address:'' ,
+        latitude : pos.coords.latitude,
+        longitude: pos.coords.longitude
+      }]);
+      liff.closeWindow();
+    }catch(err){
+      showError(err.message || '定位失敗，請檢查權限');
+      document.getElementById('retry').style.display = 'inline-block';
+    }
+  }
+
+  document.getElementById('retry').addEventListener('click', (e)=>{
+    e.preventDefault();
+    document.getElementById('retry').style.display='none';
+    document.querySelector('h1').textContent='定位中…';
+    sendLocation();
+  });
+
+  sendLocation();
+
+  function showError(msg){
+    document.querySelector('h1').textContent='無法取得定位';
+    document.getElementById('error').textContent=msg;
+  }
+})();
+</script>
+</body>
+</html>
