@@ -24,7 +24,7 @@
 
 - `index.js`：主程式入口
 - `.env`：環境變數設定
-- `.github/copilot-instructions.md`：Copilot 指令
+
 
 ## 待辦事項
 
@@ -37,7 +37,7 @@
 <!-- TDX 運輸資料流通服務 – 呼叫限制 & 點數
 狀態	認證方式	呼叫頻率	點數 / 資料量
 訪客模式（沒登入、沒帶 API Key）	只能在 Swagger 或瀏覽器	20 次 / IP / 天	無法程式介接
-基礎會員（你目前的情況）	Client Id + Client Secret
+基礎會員（目前的情況）	Client Id + Client Secret
 或 Bearer Token	5 次 / 分鐘 / Key
 （外加整體 50 次 / 秒 / IP 的大閘門）	基礎服務 0 點 – 完全免費，儘管呼叫
 進階／加值會員	另行加購	依方案提高	「加值服務」才開始吃點數（1 點 = 1 500 次 或 150 MB） -->
