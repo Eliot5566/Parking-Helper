@@ -964,7 +964,12 @@ async function findParking(lat, lng, originLabel = '', mode = 'lot', userId=null
     const w = profile?profile.prefs:{ distance:0.5, avail:0.3, price:0.2 };
     item.score = distScore*w.distance + ((availScore+predScore)/2)*w.avail + priceScore*w.price + favBoost + sourceBoost;
   });
-  allList.sort((a,b)=> b.score - a.score);
+  // 排序：先距離 (近到遠)，同距離再以智慧分數由高到低
+  allList.sort((a,b)=>{
+    const d = a.dist - b.dist;
+    if(Math.abs(d) > 1e-6) return d; // 距離不同
+    return b.score - a.score;        // 距離相近再比智慧分
+  });
 
   const plain = (originLabel?`📍 ${originLabel}\n\n`:'') + allList.slice(0,5).map(c=>[
     `${mode==='lot'?'🅿️':'🚗'} ${c.name}`,
